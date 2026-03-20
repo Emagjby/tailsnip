@@ -22,6 +22,12 @@ pub struct ApiStatusResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiErrorResponse {
+    pub ok: bool,
+    pub error: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +56,17 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         let deserialized: ApiStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn round_trips_error_response() {
+        let response = ApiErrorResponse {
+            ok: false,
+            error: "failed to read clipboard".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: ApiErrorResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(response, deserialized);
     }
 }

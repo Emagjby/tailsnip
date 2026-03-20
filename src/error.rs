@@ -134,6 +134,8 @@ impl Display for AppError {
     }
 }
 
+impl std::error::Error for AppError {}
+
 pub type AppResult<T> = Result<T, AppError>;
 
 #[cfg(test)]

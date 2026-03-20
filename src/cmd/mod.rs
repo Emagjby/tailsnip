@@ -6,7 +6,7 @@ pub mod get;
 pub mod init;
 pub mod send;
 
-pub fn run() -> AppResult<()> {
+pub async fn run() -> AppResult<()> {
     let mut args = std::env::args().skip(1);
 
     match args.next().as_deref() {
@@ -15,15 +15,15 @@ pub fn run() -> AppResult<()> {
             let target = args
                 .next()
                 .ok_or_else(|| AppError::Message("missing target device".into()))?;
-            send::run(&target)
+            send::run(&target).await
         }
         Some("get") => {
             let target = args
                 .next()
                 .ok_or_else(|| AppError::Message("missing target device".into()))?;
-            get::run(&target)
+            get::run(&target).await
         }
-        Some("daemon") => daemon::run(),
+        Some("daemon") => daemon::run().await,
         Some("init") => init::run(),
         Some(cmd) => Err(AppError::Message(format!("unknown command: {cmd}"))),
         None => Err(AppError::Message(

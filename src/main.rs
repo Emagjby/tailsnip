@@ -8,13 +8,14 @@ mod types;
 
 use error::AppResult;
 
-fn main() {
-    if let Err(err) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(err) = run().await {
         eprintln!("tailsnip: {err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> AppResult<()> {
-    cmd::run()
+async fn run() -> AppResult<()> {
+    cmd::run().await
 }
