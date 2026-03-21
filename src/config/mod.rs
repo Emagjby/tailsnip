@@ -15,27 +15,31 @@ use crate::{
 
 const CONFIG_FILE_NAME: &str = "tailsnip.toml";
 const APP_NAME: &str = "tailsnip";
-const TEMPLATE_CONFIG: &str = r#"
-# Replace the token and device addresses with your real values.
-
-token = "change-me"
-
-[devices]
-# macbook = "100.64.0.10:3947"
-# desktop = "100.64.0.11:3947"
-"#;
+const DEFAULT_DAEMON_LISTEN: &str = "127.0.0.1:3947";
 
 #[derive(Debug, Clone)]
 pub struct Config {
     #[allow(dead_code)]
     pub token: String,
+    pub daemon: DaemonConfig,
     pub devices: BTreeMap<String, SocketAddr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    pub listen: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     token: Option<String>,
+    daemon: Option<RawDaemonConfig>,
     devices: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDaemonConfig {
+    listen: Option<String>,
 }
 
 impl Config {
@@ -78,18 +82,16 @@ impl Config {
             }
         };
 
+        let daemon = validate_daemon_config(raw.daemon)?;
+
         let raw_devices = match raw.devices {
-            Some(devices) if !devices.is_empty() => devices,
-            Some(_) => {
+            Some(devices) if devices.is_empty() => {
                 return Err(AppError::ConfigValidation(
                     "devices must contain at least one entry".into(),
                 ));
             }
-            None => {
-                return Err(AppError::ConfigValidation(
-                    "missing required table: devices".into(),
-                ));
-            }
+            Some(devices) => devices,
+            None => BTreeMap::new(),
         };
 
         let mut devices = BTreeMap::new();
@@ -112,7 +114,11 @@ impl Config {
             devices.insert(alias, address);
         }
 
-        Ok(Self { token, devices })
+        Ok(Self {
+            token,
+            daemon,
+            devices,
+        })
     }
 
     pub fn device_entries(&self) -> Vec<DeviceEntry> {
@@ -124,6 +130,27 @@ impl Config {
             })
             .collect()
     }
+
+    pub fn resolve_device(&self, alias: &str) -> AppResult<SocketAddr> {
+        self.devices
+            .get(alias)
+            .copied()
+            .ok_or_else(|| AppError::DeviceNotFound(alias.to_string()))
+    }
+}
+
+fn validate_daemon_config(raw: Option<RawDaemonConfig>) -> AppResult<DaemonConfig> {
+    let listen_str = raw
+        .and_then(|d| d.listen)
+        .unwrap_or_else(|| DEFAULT_DAEMON_LISTEN.to_string());
+
+    let listen = listen_str.parse::<SocketAddr>().map_err(|_| {
+        AppError::ConfigValidation(format!(
+            "daemon.listen has invalid address '{listen_str}' (expected IP:PORT)"
+        ))
+    })?;
+
+    Ok(DaemonConfig { listen })
 }
 
 pub fn ensure_template_config() -> AppResult<PathBuf> {
@@ -150,7 +177,7 @@ pub fn ensure_template_config() -> AppResult<PathBuf> {
             }
         })?;
 
-    file.write_all(TEMPLATE_CONFIG.as_bytes())
+    file.write_all(template_config().as_bytes())
         .map_err(|e| AppError::ConfigIo {
             path: path.clone(),
             source: e,
@@ -196,6 +223,15 @@ fn validate_alias(alias: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn template_config() -> String {
+    format!(
+        "# Replace the token with your real value.\n\n\
+token = \"change-me\"\n\n\
+[daemon]\n\
+listen = \"{DEFAULT_DAEMON_LISTEN}\"\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +251,9 @@ mod tests {
             r#"
 token = "secret-token"
 
+[daemon]
+listen = "127.0.0.1:3947"
+
 [devices]
 macbook = "100.64.0.10:3947"
 desktop = "100.64.0.11:3947"
@@ -224,6 +263,9 @@ desktop = "100.64.0.11:3947"
         let config = Config::load_from_path(&path).unwrap();
 
         assert_eq!(config.token, "secret-token");
+
+        assert_eq!(config.daemon.listen.to_string(), "127.0.0.1:3947");
+
         assert_eq!(config.devices.len(), 2);
         assert_eq!(
             config.devices.get("macbook").unwrap().to_string(),
@@ -264,17 +306,15 @@ macbook = "100.64.0.10:3947"
     }
 
     #[test]
-    fn rejects_missing_devices_table() {
+    fn allows_missing_devices_table() {
         let (_dir, path) = write_config(
             r#"
 token = "secret-token"
             "#,
         );
 
-        let err = Config::load_from_path(&path).unwrap_err();
-        assert!(
-            matches!(err, AppError::ConfigValidation(msg) if msg.contains("missing required table: devices"))
-        );
+        let config = Config::load_from_path(&path).unwrap();
+        assert!(config.devices.is_empty());
     }
 
     #[test]
@@ -328,31 +368,97 @@ macbook = "invalid-address"
     }
 
     #[test]
-    fn builds_config_path_from_xdg_config_home() {
+    fn builds_config_path_from_xdg_config_home_and_creates_template_config() {
         let dir = tempfile::tempdir().unwrap();
 
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-            std::env::remove_var("HOME");
-        }
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("config::tests::template_config_helper_subprocess")
+            .arg("--nocapture")
+            .env("TAILSNIP_TEMPLATE_HELPER", "1")
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env_remove("HOME")
+            .output()
+            .unwrap();
 
-        let path = config_file_path().unwrap();
-        assert_eq!(path, dir.path().join("tailsnip").join("tailsnip.toml"));
-    }
+        assert!(
+            output.status.success(),
+            "helper subprocess failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    #[test]
-    fn creates_template_config() {
-        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tailsnip").join("tailsnip.toml");
+        assert!(path.exists());
 
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", dir.path());
-            std::env::remove_var("HOME");
-        }
-
-        let path = ensure_template_config().unwrap();
         let contents = fs::read_to_string(path).unwrap();
 
         assert!(contents.contains("token = \"change-me\""));
-        assert!(contents.contains("[devices]"));
+        assert!(contents.contains("[daemon]"));
+        assert!(contents.contains("listen = \"127.0.0.1:3947\""));
+        assert!(!contents.contains("[devices]"));
+    }
+
+    #[test]
+    fn template_config_helper_subprocess() {
+        if std::env::var_os("TAILSNIP_TEMPLATE_HELPER").is_none() {
+            return;
+        }
+
+        let path = ensure_template_config().unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn rejects_invalid_daemon_listen_address() {
+        let (_dir, path) = write_config(
+            r#"
+token = "secret-token"
+
+[daemon]
+listen = "invalid-address"
+
+[devices]
+macbook = "100.10.10.10:1010"
+desktop = "100.10.10.11:1010"
+            "#,
+        );
+
+        let err = Config::load_from_path(&path).unwrap_err();
+        assert!(
+            matches!(err, AppError::ConfigValidation(msg) if msg.contains("daemon.listen has invalid address 'invalid-address'"))
+        );
+    }
+
+    #[test]
+    fn resolves_known_device_alias() {
+        let (_dir, path) = write_config(
+            r#"
+token = "secret-token"
+
+[devices]
+macbook = "100.64.0.10:3947"
+            "#,
+        );
+
+        let config = Config::load_from_path(&path).unwrap();
+        let address = config.resolve_device("macbook").unwrap();
+        assert_eq!(address.to_string(), "100.64.0.10:3947");
+    }
+
+    #[test]
+    fn rejects_unknown_device_alias() {
+        let (_dir, path) = write_config(
+            r#"
+token = "secret-token"
+
+[devices]
+macbook = "100.64.0.10:3947"
+            "#,
+        );
+
+        let config = Config::load_from_path(&path).unwrap();
+        let err = config.resolve_device("desktop").unwrap_err();
+        assert!(matches!(err, AppError::DeviceNotFound(alias) if alias == "desktop"));
     }
 }

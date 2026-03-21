@@ -1,5 +1,8 @@
 token = "your-secret-token"
 
+[daemon]
+listen = "0.0.0.0:3947"
+
 [devices]
 macbook = "100.10.0.10:3947"
 desktop = "100.10.0.11:3947"

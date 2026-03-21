@@ -1,5 +1,6 @@
-use crate::error::{AppError, AppResult};
+use crate::{config::Config, daemon, error::AppResult};
 
-pub fn run() -> AppResult<()> {
-    Err(AppError::NotImplemented("daemon"))
+pub async fn run() -> AppResult<()> {
+    let config = Config::load()?;
+    daemon::serve(&config).await
 }
