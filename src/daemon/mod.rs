@@ -8,12 +8,9 @@ use axum::{
 };
 use constant_time_eq::constant_time_eq;
 use std::sync::Arc;
-use tokio::{
-    net::TcpListener,
-    task,
-    time::Duration,
-};
+use std::{future::Future, pin::Pin};
 use tokio::sync::Mutex;
+use tokio::{net::TcpListener, signal, task, time::Duration};
 
 use crate::{
     clipboard::{Clipboard, ClipboardBackend},
@@ -32,7 +29,16 @@ pub struct DaemonState {
 const CLIPBOARD_HANDLER_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub async fn serve(config: &Config) -> AppResult<()> {
-    let clipboard = Clipboard::detect()?;
+    serve_with_shutdown(config, shutdown_signal()).await
+}
+
+async fn serve_with_shutdown(
+    config: &Config,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+) -> AppResult<()> {
+    let clipboard = Clipboard::detect().map_err(|err| {
+        AppError::DaemonStartup(format!("clipboard backend initialization failed: {err}"))
+    })?;
 
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string());
     let wayland_display =
@@ -51,7 +57,7 @@ pub async fn serve(config: &Config) -> AppResult<()> {
         wayland_owner: Mutex::new(None),
     });
 
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     let listener = TcpListener::bind(config.daemon.listen)
         .await
@@ -64,12 +70,23 @@ pub async fn serve(config: &Config) -> AppResult<()> {
 
     println!("tailsnip daemon listening on {}", config.daemon.listen);
 
-    axum::serve(listener, app).await.map_err(|err| {
-        AppError::DaemonRuntime(format!(
-            "daemon server exited unexpectedly on {}: {err}",
-            config.daemon.listen
-        ))
-    })
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|err| {
+            AppError::DaemonRuntime(format!(
+                "daemon server exited unexpectedly on {}: {err}",
+                config.daemon.listen
+            ))
+        });
+
+    cleanup_wayland_owner(&state).await;
+
+    if result.is_ok() {
+        println!("tailsnip daemon shutting down");
+    }
+
+    result
 }
 
 fn build_router(state: Arc<DaemonState>) -> Router {
@@ -92,36 +109,36 @@ async fn require_bearer_auth(
 
     match validate_auth_header(auth_header, &state.token) {
         Ok(()) => next.run(request).await,
-        Err(err_response) => err_response,
+        Err(err_response) => *err_response,
     }
 }
 
 fn validate_auth_header(
     auth_header: Option<&axum::http::HeaderValue>,
     expected_token: &str,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let provided = match auth_header.and_then(|value| value.to_str().ok()) {
         Some(value) => value,
         None => {
-            return Err(json_error_response(
+            return Err(Box::new(json_error_response(
                 StatusCode::UNAUTHORIZED,
                 "missing authorization header",
-            ));
+            )));
         }
     };
 
     let Some(token) = provided.strip_prefix("Bearer ") else {
-        return Err(json_error_response(
+        return Err(Box::new(json_error_response(
             StatusCode::UNAUTHORIZED,
             "invalid authorization scheme",
-        ));
+        )));
     };
 
     if !constant_time_eq(expected_token.as_bytes(), token.as_bytes()) {
-        return Err(json_error_response(
+        return Err(Box::new(json_error_response(
             StatusCode::UNAUTHORIZED,
             "invalid authentication token",
-        ));
+        )));
     }
 
     Ok(())
@@ -183,8 +200,7 @@ async fn handle_write(
                     .into_response();
             }
             Ok(Err(err)) => {
-                let (status, message) =
-                    clipboard_error_parts(err, "failed to write to clipboard");
+                let (status, message) = clipboard_error_parts(err, "failed to write to clipboard");
                 return (
                     status,
                     Json(ApiErrorResponse {
@@ -289,8 +305,59 @@ fn json_error_response(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+async fn cleanup_wayland_owner(state: &Arc<DaemonState>) {
+    let old_child = {
+        let mut owner_guard = state.wayland_owner.lock().await;
+        owner_guard.take()
+    };
+
+    if let Some(mut child) = old_child {
+        let _ = task::spawn_blocking(move || {
+            let _ = child.kill();
+            let _ = child.wait();
+        })
+        .await;
+    }
+}
+
+fn shutdown_signal() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    #[cfg(unix)]
+    {
+        Box::pin(async {
+            let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+
+            tokio::select! {
+                _ = signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        })
+    }
+
+    #[cfg(not(unix))]
+    {
+        Box::pin(async {
+            let _ = signal::ctrl_c().await;
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
+
+    use axum::{
+        body::Body,
+        http::{Request as HttpRequest, StatusCode},
+    };
+    use serial_test::serial;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
     use axum::http::HeaderValue;
 
     use super::*;
@@ -330,5 +397,119 @@ mod tests {
         let header = HeaderValue::from_str("Bearer wrong-token").unwrap();
         let result = validate_auth_header(Some(&header), "secret-token");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_header_for_read_route() {
+        let state = Arc::new(DaemonState {
+            token: "testtoken".into(),
+            clipboard_backend: ClipboardBackend::LinuxXclip,
+            wayland_owner: Mutex::new(None),
+        });
+
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/clipboard/read")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn serve_reports_clipboard_startup_failures_as_daemon_startup_errors() {
+        let _path_guard = set_path_only(None);
+
+        let config = Config {
+            token: "testtoken".into(),
+            daemon: crate::config::DaemonConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+            },
+            devices: std::collections::BTreeMap::new(),
+        };
+
+        let err = serve_with_shutdown(&config, Box::pin(async {}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AppError::DaemonStartup(message) if message.contains("clipboard backend initialization failed"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn serve_returns_cleanly_after_shutdown_signal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        install_fake_clipboard_tools(&temp_dir);
+        let _path_guard = set_path_only(Some(temp_dir.path()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let config = Config {
+            token: "testtoken".into(),
+            daemon: crate::config::DaemonConfig { listen: address },
+            devices: std::collections::BTreeMap::new(),
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            serve_with_shutdown(
+                &config,
+                Box::pin(async move {
+                    let _ = rx.await;
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = tx.send(());
+
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    struct PathGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(path) => unsafe { std::env::set_var("PATH", path) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    fn set_path_only(path: Option<&Path>) -> PathGuard {
+        let original = std::env::var_os("PATH");
+
+        match path {
+            Some(path) => unsafe { std::env::set_var("PATH", path) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        PathGuard { original }
+    }
+
+    fn install_fake_clipboard_tools(temp_dir: &TempDir) {
+        install_script(temp_dir.path(), "pbcopy", "#!/bin/sh\ncat >/dev/null").unwrap();
+        install_script(temp_dir.path(), "pbpaste", "#!/bin/sh\nprintf 'stub'").unwrap();
+    }
+
+    fn install_script(dir: &Path, name: &str, contents: &str) -> std::io::Result<()> {
+        let path = PathBuf::from(dir).join(name);
+        fs::write(&path, contents)?;
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
     }
 }

@@ -2,8 +2,8 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::{
-        mpsc::{sync_channel, SyncSender},
         OnceLock,
+        mpsc::{SyncSender, sync_channel},
     },
     thread,
     time::{Duration, Instant},
@@ -52,10 +52,6 @@ impl Clipboard {
         }
     }
 
-    pub fn capability() -> ClipboardCapability {
-        detect_capability()
-    }
-
     pub fn detect_for_write() -> AppResult<Self> {
         if cfg!(target_os = "linux") {
             if env_var_present("WAYLAND_DISPLAY") && command_exists("wl-copy") {
@@ -100,10 +96,6 @@ impl Clipboard {
                 read_with_command("xclip", &["-selection", "clipboard", "-o"], command_timeout)
             }
         }
-    }
-
-    pub fn write_text(&self, text: &str) -> AppResult<()> {
-        self.write_text_with_timeout(text, CLIPBOARD_COMMAND_TIMEOUT)
     }
 
     pub fn write_text_with_timeout(&self, text: &str, command_timeout: Duration) -> AppResult<()> {
@@ -361,11 +353,11 @@ fn write_with_command_inner(
         })?;
     }
 
-    if let Some(grace_timeout) = persistent_success_grace {
-        if !wait_until_exit_or_deadline(&mut child, grace_timeout, cmd, false)? {
-            enqueue_child_reap(child);
-            return Ok(());
-        }
+    if let Some(grace_timeout) = persistent_success_grace
+        && !wait_until_exit_or_deadline(&mut child, grace_timeout, cmd, false)?
+    {
+        enqueue_child_reap(child);
+        return Ok(());
     }
 
     let output = wait_with_output_timeout(child, cmd, false, command_timeout)?;
@@ -531,7 +523,7 @@ mod tests {
 
     #[test]
     fn capability_shape_is_consistent() {
-        let capability = Clipboard::capability();
+        let capability = detect_capability();
 
         if capability.supported {
             assert!(capability.backend.is_some());

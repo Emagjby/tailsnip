@@ -174,7 +174,34 @@ fn fallback_status_message(status: StatusCode) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use tokio::net::TcpListener;
+
+    use crate::types::{ApiErrorResponse, ClipboardReadResponse};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct TestState {
+        expected_token: String,
+        read_status: StatusCode,
+        read_text: String,
+        write_status: StatusCode,
+        write_ok: bool,
+        write_message: String,
+        last_written_text: Arc<Mutex<Vec<String>>>,
+    }
 
     #[test]
     fn fallback_messsage_for_unauthorized_status_is_clear() {
@@ -208,6 +235,205 @@ mod tests {
     fn client_rejects_invalid_scheme() {
         let address: SocketAddr = "127.0.0.1:3947".parse().unwrap();
         let err = TransportClient::new_with_scheme(address, "testtoken", "ftp").unwrap_err();
-        assert!(matches!(err, AppError::Transport(msg) if msg.contains("invalid transport scheme")));
+        assert!(
+            matches!(err, AppError::Transport(msg) if msg.contains("invalid transport scheme"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_clipboard_from_successful_remote_response() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (address, _shutdown) = spawn_test_server(TestState {
+            expected_token: "testtoken".into(),
+            read_status: StatusCode::OK,
+            read_text: "hello from peer".into(),
+            write_status: StatusCode::OK,
+            write_ok: true,
+            write_message: "clipboard updated".into(),
+            last_written_text: written,
+        })
+        .await;
+
+        let client = TransportClient::new(address, "testtoken").unwrap();
+        let text = client.read_clipboard().await.unwrap();
+
+        assert_eq!(text, "hello from peer");
+    }
+
+    #[tokio::test]
+    async fn writes_clipboard_and_preserves_contract() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (address, _shutdown) = spawn_test_server(TestState {
+            expected_token: "testtoken".into(),
+            read_status: StatusCode::OK,
+            read_text: String::new(),
+            write_status: StatusCode::OK,
+            write_ok: true,
+            write_message: "clipboard updated".into(),
+            last_written_text: written.clone(),
+        })
+        .await;
+
+        let client = TransportClient::new(address, "testtoken").unwrap();
+        client.write_clipboard("copied text").await.unwrap();
+
+        assert_eq!(written.lock().unwrap().as_slice(), ["copied text"]);
+    }
+
+    #[tokio::test]
+    async fn maps_remote_unauthorized_responses_to_auth_errors() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (address, _shutdown) = spawn_test_server(TestState {
+            expected_token: "other-token".into(),
+            read_status: StatusCode::OK,
+            read_text: String::new(),
+            write_status: StatusCode::OK,
+            write_ok: true,
+            write_message: "clipboard updated".into(),
+            last_written_text: written,
+        })
+        .await;
+
+        let client = TransportClient::new(address, "testtoken").unwrap();
+        let err = client.read_clipboard().await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::TransportAuth(message) if message.contains("invalid authentication token"))
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_service_unavailable_to_remote_failure() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (address, _shutdown) = spawn_test_server(TestState {
+            expected_token: "testtoken".into(),
+            read_status: StatusCode::SERVICE_UNAVAILABLE,
+            read_text: "clipboard backend unavailable".into(),
+            write_status: StatusCode::OK,
+            write_ok: true,
+            write_message: "clipboard updated".into(),
+            last_written_text: written,
+        })
+        .await;
+
+        let client = TransportClient::new(address, "testtoken").unwrap();
+        let err = client.read_clipboard().await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::RemoteFailure(message) if message == "clipboard backend unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_unreachable_peers_to_transport_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = TransportClient::new(address, "testtoken").unwrap();
+        let err = client.read_clipboard().await.unwrap_err();
+
+        assert!(
+            matches!(err, AppError::TransportUnreachable(message) if message.contains("connection failed"))
+        );
+    }
+
+    async fn spawn_test_server(state: TestState) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let app = Router::new()
+            .route("/clipboard/read", get(handle_read))
+            .route("/clipboard/write", post(handle_write))
+            .with_state(state);
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (address, shutdown_tx)
+    }
+
+    async fn handle_read(State(state): State<TestState>, headers: HeaderMap) -> impl IntoResponse {
+        if !authorized(&state, &headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiErrorResponse {
+                    ok: false,
+                    error: "invalid authentication token".into(),
+                }),
+            )
+                .into_response();
+        }
+
+        if state.read_status != StatusCode::OK {
+            return (
+                state.read_status,
+                Json(ApiErrorResponse {
+                    ok: false,
+                    error: state.read_text,
+                }),
+            )
+                .into_response();
+        }
+
+        (
+            StatusCode::OK,
+            Json(ClipboardReadResponse {
+                text: state.read_text,
+            }),
+        )
+            .into_response()
+    }
+
+    async fn handle_write(
+        State(state): State<TestState>,
+        headers: HeaderMap,
+        Json(payload): Json<ClipboardWriteRequest>,
+    ) -> impl IntoResponse {
+        if !authorized(&state, &headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiErrorResponse {
+                    ok: false,
+                    error: "invalid authentication token".into(),
+                }),
+            )
+                .into_response();
+        }
+
+        state.last_written_text.lock().unwrap().push(payload.text);
+
+        if !state.write_status.is_success() {
+            return (
+                state.write_status,
+                Json(ApiErrorResponse {
+                    ok: false,
+                    error: state.write_message,
+                }),
+            )
+                .into_response();
+        }
+
+        (
+            StatusCode::OK,
+            Json(ApiStatusResponse {
+                ok: state.write_ok,
+                message: state.write_message,
+            }),
+        )
+            .into_response()
+    }
+
+    fn authorized(state: &TestState, headers: &HeaderMap) -> bool {
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(&format!("Bearer {}", state.expected_token))
     }
 }
