@@ -318,6 +318,21 @@ token = "secret-token"
     }
 
     #[test]
+    fn applies_default_daemon_listen_address_when_omitted() {
+        let (_dir, path) = write_config(
+            r#"
+token = "secret-token"
+
+[devices]
+macbook = "100.64.0.10:3947"
+            "#,
+        );
+
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.daemon.listen.to_string(), DEFAULT_DAEMON_LISTEN);
+    }
+
+    #[test]
     fn rejects_empty_devices_table() {
         let (_dir, path) = write_config(
             r#"
@@ -460,5 +475,28 @@ macbook = "100.64.0.10:3947"
         let config = Config::load_from_path(&path).unwrap();
         let err = config.resolve_device("desktop").unwrap_err();
         assert!(matches!(err, AppError::DeviceNotFound(alias) if alias == "desktop"));
+    }
+
+    #[test]
+    fn returns_sorted_device_entries_for_operator_output() {
+        let (_dir, path) = write_config(
+            r#"
+token = "secret-token"
+
+[devices]
+desktop = "100.64.0.11:3947"
+air = "100.64.0.12:3947"
+macbook = "100.64.0.10:3947"
+            "#,
+        );
+
+        let config = Config::load_from_path(&path).unwrap();
+        let aliases: Vec<_> = config
+            .device_entries()
+            .into_iter()
+            .map(|entry| entry.alias)
+            .collect();
+
+        assert_eq!(aliases, ["air", "desktop", "macbook"]);
     }
 }

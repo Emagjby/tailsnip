@@ -6,9 +6,6 @@ use std::{
 #[derive(Debug)]
 pub enum AppError {
     Message(String),
-    NotImplemented(&'static str),
-
-    CurrentDir(std::io::Error),
 
     ConfigMissing {
         path: PathBuf,
@@ -46,21 +43,10 @@ pub enum AppError {
     DaemonRuntime(String),
 }
 
-impl AppError {
-    pub fn message(msg: impl Into<String>) -> Self {
-        Self::Message(msg.into())
-    }
-}
-
 impl Display for AppError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Message(msg) => write!(f, "{msg}"),
-            Self::NotImplemented(feature) => write!(f, "{feature} is not implemented yet."),
-
-            Self::CurrentDir(source) => {
-                write!(f, "failed to determine current directory: {source}")
-            }
 
             Self::ConfigMissing { path, hint } => {
                 write!(f, "config file not found at '{}': {hint}", path.display(),)
